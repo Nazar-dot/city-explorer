@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>City Explorer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{height:100%;margin:0;font-family:Inter;background:#0f1115;color:#e5e7eb}
+  #app{height:100%;display:flex;flex-direction:column}
+  .topbar{z-index:1000;display:flex;align-items:center;gap:.5rem;padding:.75rem;background:rgba(23,26,32,.9);backdrop-filter:blur(6px)}
+  .brand{font-weight:700}
+  .controls{display:flex;gap:.5rem}
+  .btn{padding:.6rem .9rem;border-radius:14px;border:0;font-weight:600;cursor:pointer}
+  .btn-accent{background:#10b981;color:#04200f}
+  .btn-ghost{background:transparent;border:1px solid rgba(255,255,255,.2)}
+  .btn-danger{background:#ef4444;color:#210808}
+  #map{flex:1;position:relative}
+  #revealCanvas{position:absolute;inset:0;pointer-events:none;z-index:800}
+  .panel{padding:.6rem;background:rgba(23,26,32,.85)}
+  .statline{display:flex;align-items:center;gap:.75rem}
+  .chip{font-size:.8rem;padding:.35rem .6rem;border-radius:999px;background:rgba(0,0,0,.2)}
+  .progress-wrap{flex:1;height:12px;background:#1c2130;border-radius:999px;overflow:hidden}
+  .progress{height:100%;width:0%;background:linear-gradient(90deg,#4ade80,#60a5fa)}
+  .toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#111827;padding:.7rem 1rem;border-radius:12px;display:none}
+    /* Permission overlay */
+    .perm-overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:2500;background:linear-gradient(180deg, rgba(15,17,21,.85), rgba(15,17,21,.92));backdrop-filter:blur(6px)}
+    .perm-card{width:min(560px,92vw);background:#111827;border:1px solid rgba(255,255,255,.12);border-radius:18px;padding:20px 16px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+    .perm-title{font-weight:700;font-size:1.1rem;margin-bottom:.35rem}
+    .perm-text{color:var(--muted);font-size:.95rem;line-height:1.35}
+    .perm-actions{display:flex;gap:.5rem;margin-top:1rem}
+    .perm-note{font-size:.8rem;color:#9ba3b4;margin-top:.5rem}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <div class="brand">🗺️ City Explorer</div>
+    <div id="cityLabel">Detecting city…</div>
+    <div class="controls">
+      <button id="allowLocationBtn" class="btn btn-accent">Allow Location</button>
+      <button id="startBtn" class="btn btn-accent">Start</button>
+      <button id="pauseBtn" class="btn btn-ghost">Pause</button>
+      <button id="resetBtn" class="btn btn-danger">Reset</button>
+    </div>
+  </div>
+  <div id="map"></div>
+  <canvas id="revealCanvas"></canvas>
+  <div class="panel">
+    <div class="statline">
+      <div class="chip" id="distanceChip">0.00 km</div>
+      <div class="chip" id="tilesChip">0 tiles</div>
+      <div class="progress-wrap"><div class="progress" id="progressBar"></div></div>
+      <div class="chip" id="progressLabel">0%</div>
+    </div>
+  </div>
+    <div class=\"toast\" id=\"toast\"></div>
+
+  <!-- Location permission overlay -->
+  <div class=\"perm-overlay\" id=\"permOverlay\">
+    <div class=\"perm-card\">
+      <div class=\"perm-title\">Allow Location to Start Exploring</div>
+      <div class=\"perm-text\" id=\"permText\">We only use your location to reveal the map along your path and calculate progress. Your data stays on this device.</div>
+      <div class=\"perm-actions\">
+        <button id=\"allowBtn\" class=\"btn btn-accent\">Allow location</button>
+        <button id=\"denyBtn\" class=\"btn btn-ghost\">Not now</button>
+      </div>
+      <div class=\"perm-note\" id=\"permNote\">Tip: works best over HTTPS or localhost.</div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const STORAGE_KEY = 'cityExplorer.v1';
+  const TILE_ZOOM = 16; // balance detail/perf
+  const REVEAL_RADIUS_PX = 60; // width of revealed path on screen
+  let state = {
+    tracking:false,
+    watchId:null,
+    path:[], // {lat,lng,t}
+    visitedTiles:new Set(),
+    city:null, // {name, country, polygon, bbox, tileKeys:Set, tileCount}
+    distanceMeters:0,
+  };
+
+  /* --- Map setup --- */
+  const map = L.map('map', { zoomControl:false, attributionControl:true, inertia:true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  L.control.zoom({ position:'topright' }).addTo(map);
+
+  // Canvas overlay for grey mask reveal
+  const canvas = document.getElementById('revealCanvas');
+  const ctx = canvas.getContext('2d');
+  function resizeCanvas(){
+    const r = devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * r;
+    canvas.height = canvas.clientHeight * r;
+    ctx.setTransform(r,0,0,r,0,0);
+    drawMask();
+  }
+  const ro = new ResizeObserver(resizeCanvas);
+  ro.observe(document.getElementById('map'));
+  map.on('move zoom', drawMask);
+
+  function drawMask(){
+    const rect = canvas.getBoundingClientRect();
+    if(canvas.width !== rect.width*(devicePixelRatio||1)) resizeCanvas();
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = 'rgba(30,33,43,0.88)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = REVEAL_RADIUS_PX;
+    if(state.path.length){
+      ctx.beginPath();
+      for(let i=0;i<state.path.length;i++){
+        const p = map.latLngToContainerPoint([state.path[i].lat, state.path[i].lng]);
+        if(i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+      for(const pt of state.path){
+        const p = map.latLngToContainerPoint([pt.lat, pt.lng]);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, REVEAL_RADIUS_PX/2, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* --- UI helpers --- */
+  const cityLabel = document.getElementById('cityLabel');
+  const progressBar = document.getElementById('progressBar');
+  const progressLabel = document.getElementById('progressLabel');
+  const distanceChip = document.getElementById('distanceChip');
+  const tilesChip = document.getElementById('tilesChip');
+  const toastEl = document.getElementById('toast');
+  function toast(msg){
+    toastEl.textContent = msg;
+    toastEl.style.display = 'block';
+    setTimeout(()=>toastEl.style.display='none', 2200);
+  }
+
+  /* --- Storage --- */
+  function save(){
+    const payload = {
+      tracking: state.tracking,
+      path: state.path,
+      visitedTiles: Array.from(state.visitedTiles),
+      city: state.city ? { name: state.city.name, country: state.city.country, bbox: state.city.bbox, polygon: state.city.polygon, tileKeys: Array.from(state.city.tileKeys||[]), tileCount: state.city.tileCount||0 } : null,
+      distanceMeters: state.distanceMeters,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  }
+  function load(){
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return;
+    try{
+      const data = JSON.parse(raw);
+      state.tracking = false; // never auto-resume
+      state.path = data.path||[];
+      state.visitedTiles = new Set(data.visitedTiles||[]);
+      state.distanceMeters = data.distanceMeters||0;
+      if(data.city){
+        state.city = {
+          name: data.city.name,
+          country: data.city.country,
+          bbox: data.city.bbox,
+          polygon: data.city.polygon,
+          tileKeys: new Set(data.city.tileKeys||[]),
+          tileCount: data.city.tileCount||0
+        };
+        updateProgress();
+      }
+    }catch(e){ console.warn('Failed to load saved state', e); }
+  }
+
+  /* --- Geolocation tracking --- */
+  function requestLocationOnce(){
+    return new Promise((resolve,reject)=>{
+      if(!('geolocation' in navigator)) return reject(new Error('Geolocation not supported'));
+      navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy:true, timeout:20000, maximumAge:0 });
+    });
+  }
+  function startTracking(){
+    if(state.watchId) return;
+    if(!('geolocation' in navigator)){
+      toast('Geolocation not supported');
+      showPerm('Geolocation is not available on this device.');
+      return;
+    }
+    state.tracking = true; save();
+    state.watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
+      enableHighAccuracy:true,
+      maximumAge: 5000,
+      timeout: 20000
+    });
+    toast('Tracking started');
+  }
+  function pauseTracking(){
+    if(state.watchId){
+      navigator.geolocation.clearWatch(state.watchId);
+      state.watchId = null;
+      state.tracking = false; save();
+      toast('Tracking paused');
+    }
+  }
+  function resetAll(){
+    pauseTracking();
+    state.path = [];
+    state.visitedTiles = new Set();
+    state.distanceMeters = 0;
+    if(state.city){ state.city.tileKeys = new Set(); state.city.tileCount = state.city.tileCount||0; }
+    save();
+    drawMask();
+    updateProgress();
+  }
+
+  function onPosition(pos){
+    const { latitude:lat, longitude:lng } = pos.coords;
+    const ll = L.latLng(lat, lng);
+    if(!map._loaded){ map.setView(ll, 16); }
+    const last = state.path[state.path.length-1];
+    if(!last || distanceMeters(last.lat,last.lng,lat,lng) > 5){
+      state.path.push({lat, lng, t: Date.now()});
+      if(last){ state.distanceMeters += distanceMeters(last.lat,last.lng,lat,lng); }
+      const tile = latLngToTile(lat,lng,TILE_ZOOM);
+      const key = `${TILE_ZOOM}/${tile.x}/${tile.y}`;
+      state.visitedTiles.add(key);
+      drawMask();
+      updateProgress();
+      save();
+    }
+  }
+  function onGeoError(err){
+    console.warn(err);
+    toast(err.message || 'Location error');
+    if(err && err.code === 1 /* PERMISSION_DENIED */){
+      showPerm('We need your permission to access location and reveal the map as you walk.');
+    }
+  }
+
+  /* --- Progress calculation (tile-based vs city polygon) --- */
+  function updateProgress(){
+    distanceChip.textContent = `${(state.distanceMeters/1000).toFixed(2)} km`;
+    tilesChip.textContent = `${state.visitedTiles.size} tiles`;
+    if(!state.city || !state.city.tileCount){
+      progressBar.style.width = '0%';
+      progressLabel.textContent = '0%';
+      return;
+    }
+    let insideCount = 0;
+    for(const k of state.visitedTiles){ if(state.city.tileKeys.has(k)) insideCount++; }
+    const pct = Math.min(100, ((insideCount / state.city.tileCount) * 100) || 0);
+    progressBar.style.width = pct.toFixed(1)+'%';
+    progressLabel.textContent = pct.toFixed(1)+'%';
+  }
+
+  // Build city tile set once we know city polygon
+  async function ensureCityTiles(){
+    if(!state.city || !state.city.polygon) return;
+    if(state.city.tileKeys && state.city.tileKeys.size>0 && state.city.tileCount>0){ updateProgress(); return; }
+    const bbox = turf.bbox(state.city.polygon);
+    const [minLng,minLat,maxLng,maxLat] = bbox;
+    const minTile = latLngToTile(minLat,minLng,TILE_ZOOM);
+    const maxTile = latLngToTile(maxLat,maxLng,TILE_ZOOM);
+    const keys = new Set();
+    for(let x=minTile.x; x<=maxTile.x; x++){
+      for(let y=minTile.y; y<=maxTile.y; y++){
+        const center = tileCenterLatLng(x,y,TILE_ZOOM);
+        const p = turf.point([center.lng, center.lat]);
+        if(turf.booleanPointInPolygon(p, state.city.polygon)){
+          keys.add(`${TILE_ZOOM}/${x}/${y}`);
+        }
+      }
+    }
+    state.city.tileKeys = keys;
+    state.city.tileCount = keys.size;
+    save();
+    updateProgress();
+  }
+
+  /* --- City detection & boundary fetch from Nominatim --- */
+  async function detectCityAndFetchBoundary(lat,lng){
+    try{
+      cityLabel.textContent = 'Detecting city…';
+      const rev = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`).then(r=>r.json());
+      const addr = rev.address || {};
+      const name = addr.city || addr.town || addr.village || addr.municipality || addr.county;
+      const country = addr.country || '';
+      if(!name){ cityLabel.textContent = 'Unknown area'; return; }
+      const q = encodeURIComponent(`${name}, ${country}`);
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&limit=1&q=${q}`).then(r=>r.json());
+      if(!res || !res.length || !res[0].geojson){
+        cityLabel.textContent = name;
+        state.city = { name, country, polygon:null, bbox:null, tileKeys:new Set(), tileCount:0 };
+        save();
+        return;
+      }
+      const poly = res[0].geojson; // may be MultiPolygon
+      const bbox = res[0].boundingbox ? res[0].boundingbox.map(Number) : null;
+      const feature = { type:'Feature', properties:{ name }, geometry: poly };
+      state.city = { name, country, polygon:feature, bbox, tileKeys:new Set(), tileCount:0 };
+      cityLabel.innerHTML = `<span class="city">${name}</span> <span class="muted">${country}</span>`;
+      save();
+      ensureCityTiles();
+    }catch(e){
+      console.warn(e);
+      cityLabel.textContent = 'City boundary unavailable';
+    }
+  }
+
+  /* --- Utilities --- */
+  function distanceMeters(lat1,lon1,lat2,lon2){ // Haversine
+    const R=6371000; const toRad = d=>d*Math.PI/180;
+    const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return 2*R*Math.asin(Math.sqrt(a));
+  }
+  function latLngToTile(lat,lng,zoom){
+    const x = Math.floor((lng + 180) / 360 * Math.pow(2, zoom));
+    const y = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1/Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom));
+    return {x,y};
+  }
+  function tileCenterLatLng(x,y,zoom){
+    const n = Math.pow(2, zoom);
+    const lon_deg = x / n * 360 - 180;
+    const lat_rad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+    const lat_deg = lat_rad * 180 / Math.PI;
+    return {lat:lat_deg, lng:lon_deg};
+  }
+
+  /* --- Permission helpers --- */
+  const permOverlay = document.getElementById('permOverlay');
+  const permText = document.getElementById('permText');
+  const permNote = document.getElementById('permNote');
+  function showPerm(text){
+    if(text) permText.textContent = text;
+    if(!isSecureContext){ permNote.textContent = 'You are not on HTTPS. Location may be blocked by the browser.'; }
+    permOverlay.style.display = 'flex';
+  }
+  function hidePerm(){ permOverlay.style.display = 'none'; }
+
+  async function initPermissions(){
+    if(!('geolocation' in navigator)){
+      showPerm('This device does not support geolocation.');
+      return;
+    }
+    if('permissions' in navigator && navigator.permissions.query){
+      try{
+        const status = await navigator.permissions.query({ name: 'geolocation' });
+        handlePermState(status.state);
+        status.onchange = ()=> handlePermState(status.state);
+      }catch{ /* ignore */ }
+    }
+  }
+  function handlePermState(stateStr){
+    if(stateStr === 'granted') hidePerm();
+    else if(stateStr === 'prompt') showPerm('Allow location to start exploring your city.');
+    else if(stateStr === 'denied') showPerm('Location is blocked. Enable it in your browser settings and then tap Allow.');
+  }
+
+  async function clickAllow(){
+    try{
+      const pos = await requestLocationOnce();
+      hidePerm();
+      const {latitude:lat, longitude:lng} = pos.coords;
+      map.setView([lat,lng], 16);
+      if(!state.city){ await detectCityAndFetchBoundary(lat,lng); }
+      startTracking();
+    }catch(err){ onGeoError(err); }
+  }
+
+  /* --- Wire up UI --- */
+  document.getElementById('startBtn').addEventListener('click', async ()=>{
+    if('permissions' in navigator && navigator.permissions.query){
+      try{ const s = await navigator.permissions.query({name:'geolocation'}); if(s.state !== 'granted') { showPerm('Allow location to start tracking.'); } }catch{}
+    }
+    try{ await clickAllow(); }catch{ startTracking(); }
+  });
+  document.getElementById('pauseBtn').addEventListener('click', pauseTracking);
+  document.getElementById('resetBtn').addEventListener('click', ()=>{ if(confirm('Clear your path and progress?')) resetAll(); });
+  document.getElementById('allowBtn').addEventListener('click', clickAllow);
+  document.getElementById('denyBtn').addEventListener('click', ()=> hidePerm());
+
+  /* --- Boot --- */
+  load();
+  if(state.path.length){
+    const last = state.path[state.path.length-1];
+    map.setView([last.lat,last.lng], 16);
+    drawMask();
+  }
+  initPermissions();
+  if(!isSecureContext){ showPerm('Open over HTTPS (or localhost) so the browser allows location.'); }
+  if('geolocation' in navigator){
+    navigator.geolocation.getCurrentPosition(async (pos)=>{
+      const {latitude:lat, longitude:lng} = pos.coords;
+      map.setView([lat,lng], 16);
+      drawMask();
+      if(!state.city){ await detectCityAndFetchBoundary(lat,lng); }
+      else { cityLabel.textContent = state.city.name + (state.city.country? `, ${state.city.country}` : ''); ensureCityTiles(); }
+    }, (err)=>{
+      console.warn(err);
+      showPerm('Allow location to start exploring your city.');
+      toast('Allow location to start exploring');
+    }, { enableHighAccuracy:true, timeout:20000 });
+  }
+})();
+</script>
+</body>
+</html>
