@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>City Explorer — Fog of War</title>
+
+  <!-- Leaflet & Turf (CDN) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <style>
+    :root{
+      --bg:#0b0f14; --card:#121823; --muted:#94a3b8; --text:#e8eef7; --accent:#4cc9f0; --accent2:#22c55e; --warn:#f43f5e;
+    }
+    *{box-sizing:border-box;}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    #app{display:flex;flex-direction:column;height:100dvh;}
+
+    /* Header */
+    .topbar{
+      display:flex;align-items:center;gap:10px;padding:10px 12px;background:linear-gradient(180deg,#0b0f14 0%, #0b0f1400 100%);
+      position:sticky;top:0;z-index:1000;backdrop-filter:blur(6px);
+    }
+    .brand{font-weight:700;letter-spacing:.3px;}
+    .chip{font-size:12px;color:#cbd5e1;background:#0f172a;border:1px solid #1f2937;padding:4px 8px;border-radius:999px}
+
+    /* Map */
+    #map{flex:1;min-height:320px}
+    .leaflet-container{background:#0f172a;}
+    .leaflet-control-attribution{display:none;}
+
+    /* Controls card */
+    .panel{
+      position:fixed;left:0;right:0;bottom:0;z-index:1001;
+      padding:12px;display:grid;gap:10px;
+    }
+    .card{
+      background:linear-gradient(180deg,#0f172a 0%,#0b1220 100%);
+      border:1px solid #1e293b;border-radius:16px;padding:12px;
+      box-shadow:0 10px 30px rgba(0,0,0,.35);
+    }
+    .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .row.space{justify-content:space-between}
+    .btn{
+      appearance:none;border:none;border-radius:12px;padding:10px 14px;font-weight:600;color:#0b0f14;background:var(--accent);
+      box-shadow:0 6px 16px rgba(76,201,240,.2);transition:transform .06s ease,filter .2s ease;
+    }
+    .btn:active{transform:translateY(1px)}
+    .btn.secondary{background:#0b1220;color:#e2e8f0;border:1px solid #1f2a3b}
+    .btn.success{background:var(--accent2);box-shadow:0 6px 16px rgba(34,197,94,.25)}
+    .btn.warn{background:var(--warn);color:white}
+    .hint{font-size:12px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+
+    /* Progress ring */
+    .ring{position:relative;width:60px;height:60px}
+    .ring svg{transform:rotate(-90deg)}
+    .ring .num{position:absolute;inset:0;display:grid;place-items:center;font-size:12px;font-weight:700}
+
+    /* Permission banner */
+    .perm{
+      position:fixed;inset:auto 12px 120px 12px;z-index:1002;background:#0b1220;border:1px solid #1f2937;border-radius:14px;
+      padding:12px;display:none;gap:8px
+    }
+    .perm.show{display:flex;align-items:center;justify-content:space-between}
+    .link{color:var(--accent)}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <div class="brand">🗺️ City Explorer</div>
+    <span class="chip">Mobile • OSM</span>
+    <span class="chip" id="status">Idle</span>
+  </div>
+
+  <div id="map"></div>
+
+  <!-- Permission banner -->
+  <div id="perm" class="perm">
+    <div>
+      <div style="font-weight:700">Дозволи геолокацію</div>
+      <div class="hint">Натисни «Увімкнути геолокацію», тоді синя точка з’явиться на мапі.</div>
+    </div>
+    <button id="btnEnable" class="btn">Увімкнути</button>
+  </div>
+
+  <!-- Controls -->
+  <div class="panel">
+    <div class="card">
+      <div class="row space">
+        <div class="row">
+          <div class="ring"><svg width="60" height="60">
+            <circle cx="30" cy="30" r="26" stroke="#1f2937" stroke-width="6" fill="none"></circle>
+            <circle id="ring" cx="30" cy="30" r="26" stroke="var(--accent)" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="163.36" stroke-dashoffset="163.36"></circle>
+          </svg><div class="num"><span id="pct">0%</span></div></div>
+          <div>
+            <div style="font-weight:700">Прогрес міста</div>
+            <div class="hint"><span id="dist">0.00 км</span> • точність <span id="acc">—</span></div>
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnStart" class="btn success">Почати</button>
+          <button id="btnPause" class="btn secondary">Пауза</button>
+        </div>
+      </div>
+      <div class="grid" style="margin-top:8px">
+        <button id="btnSetArea" class="btn secondary">Встановити зону (поточний вид)</button>
+        <button id="btnReset" class="btn warn">Скинути все</button>
+      </div>
+      <div class="hint" style="margin-top:6px">Порада: наведи потрібну частину міста та натисни «Встановити зону». Прогрес рахується в межах цієї зони.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function(){
+    // ---- State ----
+    let map, base, fogPoly, watchId = null, tracking = false;
+    const holes = [];
+    const points = [];
+    const RADIUS_M = 60;
+    const STEP_MIN_METERS = 20;
+    const OFFSCREEN_SIZE = 600;
+    let cityBounds = null;
+    let distanceMeters = 0;
+    let lastPoint = null;
+  
+    // Restore
+    const saved = JSON.parse(localStorage.getItem("cx_state")||"{}");
+    if(saved.city){ cityBounds = L.latLngBounds(saved.city._southWest, saved.city._northEast); }
+    if(saved.points){ saved.points.forEach(p=>points.push(p)); }
+    if(saved.distanceMeters){ distanceMeters = saved.distanceMeters; }
+    if(saved.holes){ saved.holes.forEach(r=>holes.push(r)); }
+  
+    // ---- Map ----
+    map = L.map('map', {zoomControl:false, worldCopyJump:true});
+    base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19, attribution:'© OpenStreetMap'
+    }).addTo(map);
+  
+    if(points.length){
+      const lp = points[points.length-1];
+      map.setView([lp.lat, lp.lng], 16);
+    }else{
+      map.setView([50.4501, 30.5234], 13);
+    }
+  
+    const userMarker = L.circleMarker([0,0], {
+      radius:6, color:'#3b82f6', weight:2, fillColor:'#60a5fa', fillOpacity:0.9
+    }).addTo(map);
+  
+    // ---- Fog ----
+    const OUTER = [[85,-180],[85,180],[-85,180],[-85,-180]];
+    fogPoly = L.polygon([OUTER, ...holes], {
+      stroke:false, fill:true, fillOpacity:0.88, fillColor:'#0b0f14', fillRule:'evenodd'
+    }).addTo(map);
+  
+    // ---- UI ----
+    const $ = s=>document.querySelector(s);
+    const status = $('#status'), pct = $('#pct'), ring = $('#ring'),
+          dist = $('#dist'), acc = $('#acc'),
+          perm = $('#perm'), btnEnable = $('#btnEnable'),
+          btnStart = $('#btnStart'), btnPause = $('#btnPause'),
+          btnSetArea = $('#btnSetArea'), btnReset = $('#btnReset');
+  
+    // Small debug helper
+    function toast(msg){
+      status.textContent = msg;
+      console.log('[geo]', msg);
+    }
+  
+    // Progress ring
+    const C = 2*Math.PI*26;
+    ring.setAttribute('stroke-dasharray', C.toFixed(2));
+    function setProgress(p){
+      const o = Math.max(0, Math.min(1, p));
+      ring.setAttribute('stroke-dashoffset', (C*(1-o)).toFixed(2));
+      pct.textContent = Math.round(o*100)+'%';
+    }
+    function setDistance(m){ dist.textContent = (m/1000).toFixed(2)+' км'; }
+    setDistance(distanceMeters);
+  
+    function showPerm(v){ perm.classList.toggle('show', !!v); }
+  
+    function save(){
+      localStorage.setItem("cx_state", JSON.stringify({
+        city: cityBounds ? { _southWest: cityBounds.getSouthWest(), _northEast: cityBounds.getNorthEast() } : null,
+        points, distanceMeters, holes
+      }));
+    }
+  
+    // Geometry helpers
+    function addHole(lat, lng){
+      try{
+        const circle = turf.circle([lng, lat], RADIUS_M, {steps:32, units:'meters'});
+        const coords = circle.geometry.coordinates[0];
+        const ringLatLng = coords.map(([lo,la])=>[la,lo]);
+        holes.push(ringLatLng);
+        fogPoly.setLatLngs([OUTER, ...holes]);
+      }catch(e){ console.error(e); }
+    }
+    function distMeters(a,b){
+      const R=6371000, toRad=x=>x*Math.PI/180;
+      const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lng-a.lng);
+      const la1=toRad(a.lat), la2=toRad(b.lat);
+      const x = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(x));
+    }
+  
+    // Offscreen canvas for area compute
+    const off = document.createElement('canvas'); off.width = OFFSCREEN_SIZE; off.height = OFFSCREEN_SIZE;
+    const ox = off.getContext('2d');
+    function mercX(lon){ return (lon+180)/360; }
+    function mercY(lat){ const r=lat*Math.PI/180; return (1 - Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2; }
+  
+    function updateProgress(){
+      if(!cityBounds){ setProgress(0); return; }
+      const sw = cityBounds.getSouthWest(), ne = cityBounds.getNorthEast();
+      const x0 = mercX(sw.lng), y1 = mercY(sw.lat);
+      const x1 = mercX(ne.lng), y0 = mercY(ne.lat);
+      const w = Math.max(1, (x1-x0)*off.width), h = Math.max(1, (y1-y0)*off.height);
+  
+      const midLat = (sw.lat+ne.lat)/2;
+      const west = {lat: midLat, lng: sw.lng}, east = {lat: midLat, lng: ne.lng};
+      const north = {lat: ne.lat, lng: (sw.lng+ne.lng)/2}, south = {lat: sw.lat, lng: (sw.lng+ne.lng)/2};
+      const widthM = distMeters(west, east), heightM = distMeters(north, south);
+      const mppx = (widthM/w + heightM/h)/2;
+  
+      ox.clearRect(0,0,off.width,off.height);
+      ox.fillStyle = '#000'; ox.globalCompositeOperation = 'source-over';
+      ox.fillRect(0,0,off.width,off.height);
+      ox.globalCompositeOperation = 'destination-out';
+      for(const p of points){
+        const nx = (mercX(p.lng)-x0)/(x1-x0);
+        const ny = (mercY(p.lat)-y0)/(y1-y0);
+        if(nx< -0.1||nx>1.1||ny< -0.1||ny>1.1) continue;
+        const cx = nx*off.width, cy = (1-ny)*off.height;
+        const pr = Math.max(1, RADIUS_M / mppx);
+        ox.beginPath(); ox.arc(cx, cy, pr, 0, Math.PI*2); ox.fill();
+      }
+      ox.globalCompositeOperation = 'source-over';
+      const img = ox.getImageData(0,0,off.width,off.height).data;
+      let cleared = 0;
+      for(let i=3;i<img.length;i+=4){ if(img[i]===0) cleared++; }
+      setProgress(cleared/(off.width*off.height));
+    }
+    if(holes.length){ fogPoly.setLatLngs([OUTER, ...holes]); }
+    updateProgress();
+  
+    function inCity(latlng){ return !cityBounds || cityBounds.contains(latlng); }
+  
+    function pushPoint(lat, lng, accm){
+      const p = {lat,lng,t:Date.now(), acc:accm||null};
+      if(lastPoint){
+        const d = distMeters(lastPoint, p);
+        if(d < STEP_MIN_METERS) return;
+        distanceMeters += d; setDistance(distanceMeters);
+      }
+      lastPoint = p; points.push(p); addHole(lat,lng); save(); updateProgress();
+    }
+  
+    // ---- GEO: robust flow ----
+    function explainDenied(){
+      showPerm(true);
+      toast('Permission denied');
+      // Додаємо коротку підказку у банер
+      perm.querySelector('.hint').innerHTML =
+        'Увімкни доступ до геолокації у браузері (Налаштування → Сайт → Геолокація). Перезавантаж сторінку.';
+    }
+  
+    async function checkPermission(){
+      if(!('permissions' in navigator)) return 'prompt'; // older iOS
+      try{
+        const st = await navigator.permissions.query({name:'geolocation'});
+        return st.state; // 'granted' | 'prompt' | 'denied'
+      }catch{ return 'prompt'; }
+    }
+  
+    async function ensureSecure(){
+      if(!window.isSecureContext){
+        toast('Needs HTTPS');
+        showPerm(true);
+        perm.querySelector('.hint').innerHTML = 'Потрібен HTTPS. Увімкни “Enforce HTTPS” у GitHub Pages / SSL на кастомному домені.';
+        throw new Error('Not secure context');
+      }
+    }
+  
+    async function oneShotTest(){
+      return new Promise((resolve,reject)=>{
+        navigator.geolocation.getCurrentPosition(
+          pos=>resolve(pos),
+          err=>reject(err),
+          {enableHighAccuracy:true, maximumAge:0, timeout:10000}
+        );
+      });
+    }
+  
+    async function startWatch(){
+      if(watchId!=null) return;
+      await ensureSecure();
+      if(!('geolocation' in navigator)){
+        toast('No geolocation support');
+        alert('Геолокація не підтримується цим браузером. Спробуй Chrome/Safari останньої версії.');
+        return;
+      }
+  
+      // 1) Одноразовий запит — щоб викликати системний діалог саме після кліку
+      status.textContent = 'Requesting…';
+      try{
+        const first = await oneShotTest();
+        const {latitude, longitude, accuracy} = first.coords;
+        userMarker.setLatLng([latitude, longitude]);
+        map.setView([latitude, longitude], 16);
+        acc.textContent = Math.round(accuracy)+' м';
+        toast('定位 OK');
+      }catch(err){
+        console.warn('getCurrentPosition error', err);
+        if(err.code===1) { explainDenied(); return; } // PERMISSION_DENIED
+        if(err.code===2) toast('Position unavailable');
+        if(err.code===3) toast('Timeout');
+        showPerm(true);
+        return;
+      }
+  
+      // 2) Безперервне спостереження
+      watchId = navigator.geolocation.watchPosition(
+        (pos)=>{
+          const {latitude, longitude, accuracy} = pos.coords;
+          userMarker.setLatLng([latitude, longitude]);
+          acc.textContent = Math.round(accuracy)+' м';
+          status.textContent = tracking ? 'Tracking' : 'Ready';
+          if(tracking && inCity(L.latLng(latitude, longitude))){
+            pushPoint(latitude, longitude, accuracy);
+          }
+        },
+        (err)=>{
+          console.warn('watchPosition error', err);
+          if(err.code===1) explainDenied();
+          else if(err.code===2) toast('Position unavailable');
+          else if(err.code===3) toast('Timeout');
+          showPerm(true);
+        },
+        {enableHighAccuracy:true, maximumAge:5000, timeout:15000}
+      );
+    }
+  
+    function stopWatch(){
+      if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+    }
+  
+    // ---- Buttons (only on user gesture) ----
+    btnEnable.addEventListener('click', async ()=>{
+      showPerm(false);
+      const permState = await checkPermission();
+      toast(permState==='granted' ? 'Granted' : (permState==='prompt' ? 'Requesting…' : 'Denied'));
+      startWatch().catch(e=>console.log(e));
+    });
+  
+    btnStart.addEventListener('click', async ()=>{
+      tracking = true; status.textContent='Tracking';
+      const permState = await checkPermission();
+      if(permState==='denied'){ explainDenied(); tracking=false; return; }
+      startWatch().catch(e=>console.log(e));
+    });
+  
+    btnPause.addEventListener('click', ()=>{
+      tracking = false; status.textContent='Paused';
+    });
+  
+    btnSetArea.addEventListener('click', ()=>{
+      cityBounds = map.getBounds(); save();
+      const r = L.rectangle(cityBounds, {color:'#22c55e', weight:1, fillOpacity:0.03});
+      r.addTo(map); setTimeout(()=>map.removeLayer(r), 1200);
+      updateProgress();
+    });
+  
+    btnReset.addEventListener('click', ()=>{
+      if(!confirm('Скинути прогрес, зону, трек і дані?')) return;
+      holes.length = 0; points.length = 0; distanceMeters = 0; setDistance(0);
+      lastPoint = null; cityBounds = null; fogPoly.setLatLngs([OUTER]); save(); updateProgress();
+    });
+  
+    // Вимикаємо автозапуск — тільки після кліку
+    showPerm(true);
+  })();
+  </script>
+  
+</body>
+</html>
